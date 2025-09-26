@@ -1,78 +1,101 @@
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.runnables import RunnableLambda,RunnableParallel
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.schema import StrOutputParser
+from langchain.globals import set_llm_cache
+from langchain_community.cache import SQLiteCache
 from dotenv import load_dotenv
+import json
+import time
 
 load_dotenv()
 
 
-def response_by_model(api_key,text):
+def response_by_model(api_key, text):
+    # Enable local SQLite cache to dedupe identical prompts
+    set_llm_cache(SQLiteCache(database_path=".langchain.db"))
 
-    model=ChatGoogleGenerativeAI(model="gemini-1.5-pro",temperature=0.6,api_key=api_key)
+    # Candidate models in decreasing preference; fall back on NotFound/access errors
+    candidate_models = [
+        "gemini-1.5-flash-8b",  # widely available, cost-effective
+        "gemini-1.5-flash-001", # older pinned version
+        "gemini-1.5-flash",     # alias may resolve to -002 (not available for some)
+        "gemini-pro",           # legacy, broadly available
+    ]
+    model_index = 0
 
-    # ----------------------------------------------------------------------------------------------------------------------------------------
+    # Single prompt: ask for both variants in strict JSON to avoid extra calls
+    prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            (
+                "You are a precise content generator. Output ONLY strict JSON with keys "
+                "'fb_tips' and 'linkedin_tips'. No additional text. Each value must be a single "
+                "paragraph of up to 150 words. Do not include links."
+            ),
+        ),
+        (
+            "human",
+            (
+                "Create two platform-specific posts about the topic: {topic}.\n"
+                "- 'fb_tips': friendly, conversational, emojis ok, engaging CTA, a few hashtags.\n"
+                "- 'linkedin_tips': professional, concise, insightful, industry-relevant hashtags, clear CTA."
+            ),
+        ),
+    ])
 
-    first_prompt = ChatPromptTemplate.from_messages(messages=[
-    ("system", "You are a content generator AI model who produces positive content only.Content is restricted to have exactly 150 words only."),
-    ("human", "Generate a good quality content on the given topic: {topic}. Ensure it is easy to understand.")])
+    # Simple exponential backoff for 429/ResourceExhausted, with model fallbacks on NotFound
+    max_attempts = 4
+    backoff_seconds = 1.0
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # Build model/chain each attempt in case we change models
+            model_name = candidate_models[min(model_index, len(candidate_models) - 1)]
+            model = ChatGoogleGenerativeAI(
+                model=model_name,
+                temperature=0.4,
+                api_key=api_key,
+            )
+            chain = prompt | model | StrOutputParser()
 
+            raw = chain.invoke({"topic": text})
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                # Best-effort extraction if model added extra text
+                start = raw.find("{")
+                end = raw.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    data = json.loads(raw[start : end + 1])
+                else:
+                    raise
+            # Normalize keys for frontend
+            fb = data.get("fb_tips") or data.get("facebook") or ""
+            ln = data.get("linkedin_tips") or data.get("linkedin") or ""
+            return {"fb_tips": fb, "linkedin_tips": ln}
+        except Exception as err:
+            message = str(err)
+            last_error = err
+            # If model not found or access denied, try the next model immediately
+            not_found = (
+                "NotFound" in message
+                or "was not found" in message
+                or "does not have access" in message
+            )
+            if not_found and model_index < len(candidate_models) - 1:
+                model_index += 1
+                continue
+            is_rate_limited = (
+                "429" in message
+                or "ResourceExhausted" in message
+                or "quota" in message.lower()
+                or "rate" in message.lower()
+            )
+            if attempt == max_attempts or not is_rate_limited:
+                raise
+            time.sleep(backoff_seconds)
+            backoff_seconds *= 2
 
-    # ---------------------------------------------------------------------------------------------------------------------------------------
-    # fb work here
-    def fb_content(content):
-        """This function is used to prompt according to the facebook post."""
-        
-        fb_prompt=ChatPromptTemplate.from_messages([
-            ("system","You create engaging, high-quality Facebook posts with a friendly, conversational tone. Use emojis, hashtags, and call-to-actions for maximum engagement. Keep content concise, visually appealing, and optimized for social sharing while maintaining a positive style. Content is restricted to have exactly 150 words only.Do not generate link."),
-            ("human","Generate given content according to facebook post: {content}. Keep your content short, fun, and interactive! Add emojis, use trending hashtags, and always include a strong call-to-action.")
-        ])
-        
-        return fb_prompt.format_prompt(content=content)
-
-
-
-    fb_chain=(
-        RunnableLambda(lambda x:fb_content(x)) | model | StrOutputParser()
-    )
-
-
-
-    # ----------------------------------------------------------------------------------------------------------------------------------------
-    #linkedin work here
-
-
-    def linkedin_content(content):
-        """This is used for linkedin prompting"""
-        
-        linkedin_prompt = ChatPromptTemplate.from_messages([
-                ("system", "You create professional, engaging, and high-quality LinkedIn posts. Your content should be insightful, value-driven, and formatted to encourage networking and professional discussions. Use a formal yet approachable tone, incorporate relevant hashtags, and include a clear call-to-action for engagement. Keep posts structured, informative, and optimized for LinkedIn's audience.Content is restricted to have exactly 150 words only.Do not generate link."),
-                ("human", "Generate the given content as a LinkedIn post: {content}. Make it professional, insightful, and engaging. Use industry-relevant hashtags, maintain clarity, and encourage meaningful interactions.")])
-        
-        return linkedin_prompt.format_prompt(content=content)
-
-
-    linkedin_chain=(
-        RunnableLambda(lambda x:linkedin_content(x)) | model | StrOutputParser()
-    )
-
-    # ------------------------------------------------------------------------------------------------------------------------------------------
-
-    def showing_both_content(content1,content2):
-        """Combining the content of the both to display"""
-        return {"fb_tips":content1,"linkedin_tips":content2}
-
-    # -----------------------------------------------------------------------------------------------------------------------------------------#
-    # """ Using Chains to connect each components easily"""
-    chain= (
-        first_prompt|
-        model|
-        StrOutputParser()|
-        RunnableParallel(branches={"facebook": fb_chain, "linkedin": linkedin_chain})|
-        RunnableLambda(lambda x: showing_both_content(x["branches"]["facebook"], x["branches"]["linkedin"]))
-    )
-
-    response=chain.invoke({"topic":text})
-
-    return response
+    # If all retries failed, re-raise last error
+    raise last_error
 
